@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Plugin Metadata API** — plugins can now read a song's album, year,
+  genre, and MusicBrainz identifiers (recording/release/artist MBID, ISRC)
+  through the highway WebSocket's optional `metadata` object on `song_info`
+  or via `GET /api/song/{filename}/metadata`. Purely additive — no existing
+  field, route, or payload shape changes. See docs/PLUGIN_METADATA_API.md.
 - **Gigs (the career verb, frontend)** — book a gig from any opened passport:
   a gig poster proposes the setlist (re-roll for a different bill; save or
   copy the poster as a PNG), "Play the gig" hands the set to the play queue

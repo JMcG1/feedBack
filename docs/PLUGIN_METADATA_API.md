@@ -5,7 +5,6 @@ MusicBrainz identifiers, when known. Exposes information the server
 already computes (via its MusicBrainz/AcoustID enrichment worker) but
 that previously never reached a plugin.
 
-Design background and rationale: `docs/PLUGIN_METADATA_API_PROPOSAL.md`.
 Underlying data investigation: `docs/MUSICBRAINZ_METADATA_AUDIT.md` (in
 the `song-background-manager` repository).
 
