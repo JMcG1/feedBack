@@ -1,16 +1,18 @@
 # Plugin Metadata API — Runtime Verification & PR Preparation
 
-Final runtime verification of the generic plugin metadata implementation (`lib/plugin_metadata.py`, the `song_info` WebSocket extension, `GET /api/song/{filename}/metadata`) in the real `core-development` environment, immediately before staging for the upstream PR. No redesign, no new functionality, no changes to Song Background Manager.
+Runtime verification record for the generic plugin metadata implementation (`lib/plugin_metadata.py`, the `song_info` WebSocket extension, `GET /api/song/{filename}/metadata`) in the real `core-development` environment. Originally written immediately before staging for the upstream PR; regenerated below to reflect that the PR has since been opened as [#1045](https://github.com/got-feedBack/feedBack/pull/1045). No redesign, no new functionality, no changes to Song Background Manager.
 
 ## Executive summary
 
-The implementation is unchanged and continues to check out cleanly. A genuine attempt was made to activate the real environment and run the real test commands (`pytest tests/test_plugin_metadata.py -q`, `pytest tests/test_plugin_metadata_api.py -q`, `python main.py`) exactly as specified — every one of them fails at the dependency layer, not the code layer, because this sandbox cannot reach `pypi.org` to install `fastapi`/`pytest`/`websockets`/`structlog`/etc. This is the same hard, environment-level restriction already documented in the prior verification pass, re-confirmed fresh here with the literal commands this task specified. No workaround was attempted, consistent with this engagement's standing policy on network restrictions.
+This record has been regenerated to replace the "staged, not yet committed" snapshot from the prior verification pass with what has since actually happened: three DCO-signed commits — `52c9408` (feature), `ad37cb6` (CHANGELOG + docs), `7221f6a` (a fix for one automated review finding) — landed on `feature/plugin-metadata-api`, were pushed to `origin` (`JMcG1/feedBack`), and are open as pull request [#1045](https://github.com/got-feedBack/feedBack/pull/1045) against `got-feedBack/feedBack:main`.
 
-In place of a live run, the implementation's correctness was re-verified two independent ways: (1) a manual harness that imports the real `plugin_metadata_for()` and the real `tests/test_plugin_metadata.py` test bodies and executes them against a real, temporary SQLite database — 9/9 harness cases passed, covering the same 16 assertions the real pytest file expresses as 16 parametrized test items; (2) a fresh standalone simulation of the REST route's exact internal logic — 6/6 passed. Both were re-run from scratch in this session, not reused from the prior pass, and produced consistent results. `git diff --ignore-cr-at-eol` confirms the code changes remain exactly the intended, additive 79 lines across 3 files, with two categories of unrelated pre-existing repository content (a CRLF/LF checkout artifact, and a separate uncommitted "Temporary Background API" feature plus a Song Background Manager plugin copy) identified and excluded from staging.
+Real `pytest` evidence now exists, closing the prior pass's biggest gap. On the contributor's own Windows machine (Python 3.14.6, pytest 9.1.1), `pytest tests/test_plugin_metadata.py tests/test_plugin_metadata_api.py -q` collected **31 items** (23 in `test_plugin_metadata.py`, 8 in `test_plugin_metadata_api.py`) and passed all 31; a separate run of the WS regression suite (`test_highway_ws_authors.py`, `test_highway_ws_instrument_routing.py`, `test_highway_ws_notation.py`, `test_ws_highway_disconnect.py`) collected and passed all 21. `git diff --check dd1927e..HEAD` is clean. This sandbox still cannot install `pytest`/`fastapi` (`pypi.org` remains blocked), so the manual harness below was re-run fresh as a cross-check rather than as the only evidence.
 
-Because no `fastapi`/`pytest` environment could be activated, this cannot claim a literal "runtime verification succeeded" in the sense of a live server handling a live WebSocket connection — that specific evidence does not exist and won't inside this sandbox. Everything that *can* be verified without that — wiring, logic correctness, backwards compatibility, performance characteristics, diff cleanliness — was verified for real and found sound, with no defect of any kind surfacing anywhere in this pass or the prior one.
+`tests/test_plugin_metadata.py` now collects **23 items**, up from 16 in the prior pass. The 7 added items — from 5 new test functions, one parametrized over 3 match states — cover `base_metadata`: per-field override of a populated cache, blank/zero values falling through to the cache rather than clobbering it, a partial `base_metadata` still pulling `genre` from the cache, and confirmed/unconfirmed enrichment gating being unaffected by `base_metadata` either way.
 
-**Verdict: READY TO COMMIT UPSTREAM PR**, staged per Step 7 below, not committed.
+Diff scope is nine files, not three: `CHANGELOG.md`, `docs/PLUGIN_METADATA_API.md`, `docs/PLUGIN_METADATA_FINAL_VERIFICATION.md`, `lib/plugin_metadata.py`, `lib/routers/song.py`, `lib/routers/ws_highway.py`, `static/highway.js`, `tests/test_plugin_metadata.py`, `tests/test_plugin_metadata_api.py` — 1,177 insertions, 0 deletions, per `git diff --stat dd1927e..HEAD`.
+
+**Status: SUBMITTED.** PR #1045 is open and has already absorbed one review round. This document is a historical verification record, not a pre-commit gate — it no longer recommends whether to commit or push.
 
 ## Environment
 
@@ -33,27 +35,34 @@ Both failures are dependency-installation failures, not application or feature d
 
 ## Unit test results
 
-`tests/test_plugin_metadata.py` — re-executed fresh this session via a manual harness (written this session, not reused) that imports the real `plugin_metadata_for()`/`PLUGIN_METADATA_VERSION` and drives the real test file's bodies against a real, temporary `MetadataDB`:
+Real evidence now exists and supersedes the manual harness as primary evidence: on the contributor's Windows machine, `pytest tests/test_plugin_metadata.py -q` collected and passed all **23 items** (confirmed via the real pytest header reporting `collected 31 items` across this file plus `test_plugin_metadata_api.py` combined, 100% passed, zero failures, zero warnings).
+
+This sandbox still cannot install `pytest`, so as a cross-check the manual harness was re-run fresh this session, extended to cover the 5 `base_metadata` test functions added since the prior pass (previously only 9 groups/16 items were covered here):
 
 ```
-. test_returns_versioned_shape_for_unknown_song (0.12ms)
-. test_metadata_version_is_present_and_stable (0.10ms)
-. test_playback_metadata_with_no_enrichment (1.78ms)
-. test_year_coercion_never_raises (19.72ms)
-. test_album_artist_is_always_none (2.02ms)
-. test_matched_enrichment_populates_identifiers (4.06ms)
-. test_manual_pin_is_treated_as_confirmed (3.88ms)
-. test_unconfirmed_states_never_leak_identifiers (10.89ms)
-. test_output_is_a_plain_json_serializable_dict (5.54ms)
+. test_returns_versioned_shape_for_unknown_song (161.87ms)
+. test_metadata_version_is_present_and_stable (166.05ms)
+. test_playback_metadata_with_no_enrichment (153.90ms)
+. test_year_coercion_never_raises (136.96ms)
+. test_album_artist_is_always_none (123.68ms)
+. test_matched_enrichment_populates_identifiers (124.07ms)
+. test_manual_pin_is_treated_as_confirmed (113.76ms)
+. test_unconfirmed_states_never_leak_identifiers (118.29ms)
+. test_base_metadata_overrides_populated_cache_per_field (106.20ms)
+. test_blank_and_zero_base_metadata_falls_through_to_cache (109.43ms)
+. test_partial_base_metadata_still_pulls_missing_fields_from_cache (119.49ms)
+. test_confirmed_enrichment_still_available_with_base_metadata (118.70ms)
+. test_unconfirmed_enrichment_still_hidden_with_base_metadata (117.25ms)
+. test_output_is_a_plain_json_serializable_dict (121.32ms)
 
-9 passed, 0 failed in 1.25s (manual harness substitute for pytest -q)
+14 groups passed, 0 failed, 23 pytest-equivalent items covered
 ```
 
-Note on count: the harness collapses the real file's two `@pytest.mark.parametrize` tests (`test_year_coercion_never_raises` — 6 cases; `test_unconfirmed_states_never_leak_identifiers` — 3 cases) into single functions that loop and assert every case internally, rather than pytest's one-item-per-case collection. Real `pytest -q` would report **16 passed**, not 9 — the harness exercises the identical 16 assertions, just grouped differently for a manual runner. No warnings observed.
+Note on count: the harness groups by function (14 groups), while real `pytest -q` collects one item per parametrized case — `test_year_coercion_never_raises` (6 cases), `test_unconfirmed_states_never_leak_identifiers` (3 cases), and `test_unconfirmed_enrichment_still_hidden_with_base_metadata` (3 cases, added this round) each count as multiple items — for a real total of 23, matching the real pytest run's own collection count exactly, not merely a projection. Per-case timings here are dominated by this sandbox's per-database WAL-mode setup cost (~100-160ms/case) rather than the query logic itself; they aren't comparable to real pytest's timing and aren't offered as a performance measurement.
 
 ## Integration test results
 
-`tests/test_plugin_metadata_api.py` — still cannot be executed (`fastapi.testclient.TestClient` unavailable). Re-confirmed this session:
+`tests/test_plugin_metadata_api.py` — real evidence now exists: it collected and passed all **8 items** on the contributor's Windows machine, as part of the same 31-item run cited above. This sandbox still cannot execute it (`fastapi.testclient.TestClient` unavailable, `pypi.org` blocked); the manual simulation below remains a sandbox-only cross-check, not the primary evidence anymore.
 
 - Full read of the file: its WS/REST fixtures are adapted from `tests/test_highway_ws_authors.py` and `tests/test_art_candidates.py`'s own already-established patterns, not novel test infrastructure.
 - Fresh standalone simulation of the REST route (`get_song_plugin_metadata`'s body reproduced verbatim, calling the real `_resolve_dlc_path` and `plugin_metadata_for`), run fresh this session against a newly seeded song:
@@ -71,7 +80,7 @@ PASS malformed_filename_no_crash
 
 ## Full suite results
 
-Not executable — no `pytest` in this environment. No baseline comparison possible for the same reason. This remains the single most important thing to run for real before this PR merges, ideally where `requirements-test.txt` can actually be installed.
+Not executable in this sandbox — no `pytest` here, and `pypi.org` remains blocked. Real evidence exists for the relevant regression slice, though, not the whole repository suite: the contributor's real `pytest` run of `test_highway_ws_authors.py`, `test_highway_ws_instrument_routing.py`, `test_highway_ws_notation.py`, and `test_ws_highway_disconnect.py` collected and passed all 21 items, confirming the WS `song_info` change didn't regress the existing highway WebSocket behavior. A full-repository suite run has not been reported and is not claimed here.
 
 ## Performance observations
 
@@ -87,26 +96,27 @@ Re-measured fresh this session against a newly seeded real SQLite database (not 
 
 - `plugin_metadata_for()` remains the sole assembly function — confirmed by `grep -rn "def plugin_metadata_for" lib/`, one result.
 - Route precedence re-confirmed: `/user-meta` → `/overrides` → `/gap-fill` → `/metadata` (new) → bare `{filename:path}`, in that registration order in `lib/routers/song.py` — the greedy catch-all still cannot shadow the new route.
-- `python3 -m py_compile` clean on all 5 feature files; `node --check static/highway.js` clean.
-- Every change across the 3 modified files is additive — `git diff --ignore-cr-at-eol` shows zero deletions in `lib/routers/song.py`, `lib/routers/ws_highway.py`, or `static/highway.js`.
+- `python3 -m py_compile` clean on all 5 Python feature files; `node --check static/highway.js` clean.
+- Every change across the current nine-file diff (`dd1927e..HEAD`) is additive — `git diff --stat dd1927e..HEAD` shows 1,177 insertions, 0 deletions.
 - Old plugins / old clients: `msg.metadata ?? null` in `static/highway.js` means an old server (no `metadata` key) degrades to `null` rather than `undefined`-chasing errors; a new server against old plugin code that never reads `metadata` is unaffected because nothing existing changed shape or name.
 
-## Files staged
+## Files changed
 
-Per this task's explicit Step 7 list, staged with individual `git add` calls (not `git add .` / `git add -A`):
+No longer a staging list — these files are committed (across the 3 commits listed in the executive summary) and pushed to `feature/plugin-metadata-api`, per `git diff --stat dd1927e..HEAD`:
 
 ```
+CHANGELOG.md
+docs/PLUGIN_METADATA_API.md
+docs/PLUGIN_METADATA_FINAL_VERIFICATION.md
 lib/plugin_metadata.py
 lib/routers/song.py
 lib/routers/ws_highway.py
 static/highway.js
 tests/test_plugin_metadata.py
 tests/test_plugin_metadata_api.py
-docs/PLUGIN_METADATA_API.md
-docs/PLUGIN_METADATA_FINAL_VERIFICATION.md
 ```
 
-No additional files were required or staged beyond this list.
+Nine files, 1,177 insertions, 0 deletions. `CHANGELOG.md` was added to this list in the DCO/PR-readiness pass (it wasn't part of the original 8-file staging round this section previously described); every other file was already present in the original list.
 
 ## Remaining unstaged files (confirmed excluded, not part of this PR)
 
@@ -117,17 +127,9 @@ No additional files were required or staged beyond this list.
 
 ## Risks
 
-- No genuine live-server or live-`pytest` run exists for this feature in this sandbox, for the reasons documented above — this is an environment limitation, not evidence of a defect, but it is a real gap in the evidence available and should be closed with a real `pytest tests/test_plugin_metadata.py tests/test_plugin_metadata_api.py` plus the full suite on a machine with working dependency installation before this PR is merged.
-- Everything checked in this pass — wiring, logic, compatibility, diff scope, performance characteristics — is consistent with the prior verification pass and shows no regression or new issue.
+- ~~No genuine live-`pytest` run exists for this feature~~ — **resolved**: real `pytest` evidence now exists for both new test files (31/31) and the WS regression slice (21/21), all on the contributor's own machine. No full-repository suite run has been reported, so that broader claim is not made here.
+- Everything checked across this and prior passes — wiring, logic, compatibility, diff scope — remains consistent with no regression or new issue found in either the added tests or the real runs.
 
 ## Recommendation
 
-Staged (not committed) exactly per the list above. Recommended commit message:
-
-```
-feat: expose enriched metadata to plugins
-```
-
-Do not commit. Do not push.
-
-**READY TO COMMIT UPSTREAM PR**
+The PR is open and under review; there is no pending commit/push decision left for this document to gate. If further review feedback lands, the established pattern for this branch is: fix, `git commit -s`, `git push origin feature/plugin-metadata-api` — the same flow already used once for `7221f6a`.
