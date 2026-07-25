@@ -172,10 +172,14 @@ window.feedBack.on('song:loaded', (e) => {
 ```
 
 A plugin built against an older server (or one running against this
-server before this feature shipped) simply never sees a `metadata` key
-— `song.metadata` is `undefined`, and `song.metadata?.album` evaluates
-to `undefined` rather than throwing. No feature-detection dance is
-required for this specific kind of purely-additive change.
+server before this feature shipped) gets a `song_info` frame with no
+`metadata` key at all — but `static/highway.js` always assigns
+`metadata: msg.metadata ?? null` when building `currentSong`, so
+`song.metadata` is `null` in that case, not `undefined`.
+`song.metadata?.album` still evaluates safely to `undefined` rather
+than throwing (optional chaining short-circuits the same way on `null`
+as on `undefined`). No feature-detection dance is required for this
+specific kind of purely-additive change.
 
 ## Choosing WebSocket vs. REST
 
