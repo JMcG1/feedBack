@@ -371,3 +371,104 @@ def test_gig_propose_backfill_offset_survives_stakes(client, meta_db):
     files = [s["filename"] for s in res.json()["songs"]]
     assert len(files) == 5 and len(set(files)) == 5
     assert "near.feedpak" in files
+
+
+# ── Gold rung ─────────────────────────────────────────────────────────────────
+
+def test_gold_upgrades_bronze_via_family_style_artifact(client, meta_db):
+    # Bronze earned on 'death metal' (family: metal); a metal gold artifact
+    # from the jam verifier upgrades it — bronze-only stays 'earned' elsewhere.
+    for i in range(5):
+        meta_db.add(f"dm{i}.feedpak", 0, 0.9, genre="Death Metal", arrangements=LEAD)
+    career_routes._state["passports_content"]["genres"]["metal"] = {}  # no drill gate for this test
+    _open(client, "guitar", "Death Metal")
+    client.post("/api/plugins/career/drill-state", json={"byNode": {}})
+    assert _passport(client, "guitar", "death metal")["badge"] == "earned"
+    client.post("/api/plugins/career/drill-state", json={
+        "byNode": {}, "goldImprov": {"metal": {"at": 1, "verifier": "comb", "inKeyPct": 0.9}}})
+    assert _passport(client, "guitar", "death metal")["badge"] == "gold"
+
+
+def test_gold_without_bronze_stays_in_progress(client, meta_db):
+    meta_db.add("one.feedpak", 0, 0.9, genre="Soul", arrangements=LEAD)
+    _open(client, "guitar", "Soul")
+    client.post("/api/plugins/career/drill-state", json={
+        "byNode": {}, "goldImprov": {"soul": {"at": 1, "verifier": "comb"}}})
+    assert _passport(client, "guitar", "soul")["badge"] == "in_progress"
+
+
+def test_gold_merge_is_gained_only(client, meta_db):
+    for i in range(5):
+        meta_db.add(f"s{i}.feedpak", 0, 0.9, genre="Soul", arrangements=LEAD)
+    _open(client, "guitar", "Soul")
+    client.post("/api/plugins/career/drill-state", json={
+        "byNode": {}, "goldImprov": {"soul": {"at": 1, "verifier": "comb"}}})
+    assert _passport(client, "guitar", "soul")["badge"] == "gold"
+    # A stale relay without the artifact never un-mints.
+    client.post("/api/plugins/career/drill-state", json={"byNode": {}})
+    assert _passport(client, "guitar", "soul")["badge"] == "gold"
+    # And a different artifact for the same style never overwrites the first —
+    # asserted against the PERSISTED snapshot (the view doesn't expose
+    # artifact contents), so a last-write-wins regression can't stay green.
+    client.post("/api/plugins/career/drill-state", json={
+        "byNode": {}, "goldImprov": {"soul": {"at": 999, "verifier": "yin"}}})
+    _, _, gold = career_routes._drill_by_node()
+    assert gold["soul"] == {"at": 1, "verifier": "comb"}
+
+
+def test_gold_matches_raw_style_id_through_family(client, meta_db):
+    # Virtuoso mints under raw STYLE_PALETTES ids ('punk', not 'rock'): a
+    # 'punk rock' passport (family rock) must go gold from a 'punk' artifact.
+    for i in range(5):
+        meta_db.add(f"pk{i}.feedpak", 0, 0.9, genre="Punk Rock", arrangements=LEAD)
+    career_routes._state["passports_content"]["genres"]["rock"] = {}  # no drill gate
+    _open(client, "guitar", "Punk Rock")
+    client.post("/api/plugins/career/drill-state", json={
+        "byNode": {}, "goldImprov": {"punk": {"at": 1, "verifier": "comb"}}})
+    assert _passport(client, "guitar", "punk rock")["badge"] == "gold"
+
+
+def test_gold_intake_rejects_junk(client, meta_db):
+    # A non-dict goldImprov is a relay bug: loud 400, never a silent drop.
+    res = client.post("/api/plugins/career/drill-state",
+                      json={"byNode": {}, "goldImprov": ["metal"]})
+    assert res.status_code == 400
+    # Evidence-free artifacts (no verifier) never mint.
+    for i in range(5):
+        meta_db.add(f"j{i}.feedpak", 0, 0.9, genre="Soul", arrangements=LEAD)
+    _open(client, "guitar", "Soul")
+    client.post("/api/plugins/career/drill-state", json={
+        "byNode": {}, "goldImprov": {"soul": {}}})
+    assert _passport(client, "guitar", "soul")["badge"] == "earned"
+    # An oversized goldImprov is bounded BEFORE the merge, like byNode.
+    blob = {f"s{i}": {"verifier": "comb", "pad": "x" * 4096} for i in range(200)}
+    res = client.post("/api/plugins/career/drill-state",
+                      json={"byNode": {}, "goldImprov": blob})
+    assert res.status_code == 413
+
+
+def test_gig_includes_songs_played_on_another_instrument(client, meta_db):
+    # feedBack#… (tester): "Metalcore says 137 songs, only shows 1 in the gig list".
+    # A song played on a DIFFERENT instrument's arrangement has a stats row, so it
+    # was excluded from the unplayed filler — and its played bucket is that other
+    # instrument's, not this passport's — so it fell into a gap and could never be
+    # gigged. A guitar passport with a library of bass-played metalcore got a 404.
+    for i in range(137):
+        meta_db.add(f"mc{i}.feedpak", 0, 0.80, genre="Metalcore", arrangements=BASS)
+    res = client.post("/api/plugins/career/gigs/propose",
+                      json={"instrument": "guitar", "genre": "Metalcore", "size": 4})
+    assert res.status_code == 200, "a full library of the genre must never 404"
+    assert len(res.json()["songs"]) == 4, "the gig must fill from the library, not the gap"
+
+
+def test_gig_reroll_changes_the_set(client, meta_db):
+    # feedBack#… (tester): "Passport re-roll does not change songs". A set drawn
+    # from the filler used to be the library's first N in table order, every time.
+    for i in range(40):
+        meta_db.add_song_only(f"un{i}.feedpak", genre="Metalcore")
+    sets = set()
+    for _ in range(5):
+        r = client.post("/api/plugins/career/gigs/propose",
+                        json={"instrument": "guitar", "genre": "Metalcore", "size": 4})
+        sets.add(tuple(sorted(s["filename"] for s in r.json()["songs"])))
+    assert len(sets) > 1, "re-roll must be able to produce a different set"

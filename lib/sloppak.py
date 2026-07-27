@@ -80,6 +80,20 @@ def find_full_mix(stems: list[dict]) -> dict | None:
     )
 
 
+def stem_default_on(raw) -> bool:
+    """Whether a manifest stem entry plays by default.
+
+    Absent means on. A string is honoured so a hand-written manifest can say
+    `default: off`. Extracted so the WS `ready` payload and the REST song-info
+    payload cannot drift: the stems plugin now preloads from REST and then has
+    to agree with what the WS says a moment later, or it would rebuild the whole
+    graph for nothing.
+    """
+    if isinstance(raw, str):
+        return raw.lower() not in ("off", "false", "0", "no")
+    return bool(raw)
+
+
 def partition_stems(stems: list[dict]) -> tuple[dict | None, list[dict]]:
     """Split stem descriptors into (mixdown, instrument_stems) for PLAYBACK.
 
@@ -105,6 +119,41 @@ def partition_stems(stems: list[dict]) -> tuple[dict | None, list[dict]]:
     if full is None:
         return None, stems
     return full, [s for s in stems if str(s.get("id", "")) != FULL_MIX_STEM_ID]
+
+
+def _resolve_pack_path(source_dir: Path, rel: str, label: str) -> Path | None:
+    """Resolve a manifest-relative path, contained inside the pack. None if not.
+
+    Every manifest key that names a file routes through here. A crafted manifest
+    must not read outside the sloppak directory via path traversal
+    (e.g. `../../etc`), and a symlink loop or permission error on `.resolve()`
+    must disable that one file rather than abort the whole load — so both
+    failures are caught, and both are warnings rather than raises.
+
+    The two branches log differently on purpose: a `ValueError` means the path
+    resolved *outside* the pack (a crafted or broken manifest), an `OSError`
+    means it could not be resolved at all (symlink loop, permissions). Reading
+    "escapes source_dir" in the logs and reading "resolution failed" lead an
+    operator to very different places, so the distinction is worth two lines.
+
+    Returns the resolved path — **existence is NOT checked here**. Callers
+    differ on that deliberately: a missing optional side-file is silent, while a
+    missing arrangement skips an entry, so each caller keeps its own `.exists()`
+    (or `.is_file()`) test and its own control flow.
+
+    `label` names the manifest key in the log message ("keys", "song_timeline",
+    a drum part's id, …).
+    """
+    try:
+        p = (source_dir / rel).resolve()
+        p.relative_to(source_dir.resolve())
+    except ValueError:
+        log.warning("sloppak: %s path %r escapes source_dir — skipped", label, rel)
+        return None
+    except OSError as e:
+        log.warning("sloppak: %s path resolution failed (%s) — skipped", label, e)
+        return None
+    return p
 
 
 def _legacy_full_mix(manifest: dict, source_dir: Path) -> str | None:
@@ -138,16 +187,8 @@ def _legacy_full_mix(manifest: dict, source_dir: Path) -> str | None:
     if not isinstance(rel_raw, str) or not rel_raw.strip():
         return None
     rel = rel_raw.strip()
-    try:
-        target = (source_dir / rel).resolve()
-        target.relative_to(source_dir.resolve())
-    except ValueError:
-        log.warning("sloppak: original_audio path %r escapes source_dir — skipped", rel)
-        return None
-    except OSError as e:
-        log.warning("sloppak: original_audio path resolution failed (%s) — skipped", e)
-        return None
-    if not target.is_file():
+    target = _resolve_pack_path(source_dir, rel, "original_audio")
+    if target is None or not target.is_file():
         return None
     log.info(
         "sloppak: pack uses the deprecated `original_audio:` key (%r) — the full mix "
@@ -684,6 +725,14 @@ class LoadedSloppak:
     # absent / unreadable / malformed. Streamed over the highway WS as a
     # `keys` message; consumers (renderers, plugins) read it from there.
     keys: dict | None = None
+    # Parsed `rigs.json` payload (manifest `rigs:` key, spec §7.9) — the pack's
+    # library of engine-agnostic signal chains: effect chains and, since
+    # feedpak 1.18.0, MIDI-voiced sound sources. Arrangements bind rigs to time
+    # by referencing a rig `id` from `tones.base_rig` / `tones.changes[].rig`
+    # (§6.9), which `lib/tones.py` carries onto the wire. None when absent /
+    # unreadable / malformed. Rig objects are kept verbatim — this loader does
+    # not select realizations or apply the `intent.gm` floor.
+    rigs: dict | None = None
     # Sanitized song-level tempo + time-signature maps from `song_timeline.json`
     # (feedpak 1.2.0). `tempos`: [{time, bpm}]; `time_signatures`: [{time, ts}].
     # None when absent/empty. Streamed over the highway WS (`tempos` /
@@ -716,6 +765,227 @@ class LoadedSloppak:
     # separated stems the moment one drops below 100% — demucs recombination is
     # lossy, so the mixdown is strictly the better audio when nothing is muted.
     full_mix: str | None = None
+    # The song's DRUM PARTS (feedpak 1.17.0 "drums as arrangements"): one dict
+    # {"id", "name", "drum_tab"} per part, primary FIRST. A part comes from a
+    # `type: drums` arrangement entry carrying a per-arrangement `drum_tab`
+    # file pointer and NO note `file` — entries this loader deliberately never
+    # turns into fretted Arrangements (see the file/notation gate in
+    # load_song; that skip IS the grading invariant). The primary part's
+    # payload is the SAME object as `drum_tab` above (the song-level key is
+    # its back-compat alias). None when the pack has no drums at all; a
+    # single-part list for a legacy pack with only the song-level key.
+    drum_parts: list[dict] | None = None
+
+
+def _load_drum_tab_file(source_dir: Path, rel: str, label: str) -> dict | None:
+    """Load + schema-validate one drum-tab JSON named by a manifest-relative
+    path. Shared by the song-level `drum_tab:` key and the per-arrangement
+    drum-part pointers (feedpak 1.17.0), so every tab gets the same posture:
+    permissive — a missing file disables that part silently; a traversal,
+    parse, or validation failure disables it with a warning, never aborting
+    the load."""
+    dt_path = _resolve_pack_path(source_dir, rel, label)
+    if dt_path is None or not dt_path.exists():
+        return None
+    try:
+        raw = load_json(dt_path)
+    except Exception as e:
+        log.warning("sloppak: failed to parse %s %r: %s", label, rel, e)
+        return None
+    ok, reason = drums_mod.validate_drum_tab(raw)
+    if not ok:
+        log.warning("sloppak: %s %r failed validation: %s", label, rel, reason)
+        return None
+    return raw
+
+
+def _load_rigs_file(source_dir: Path, rel: str) -> dict | None:
+    """Load the pack's rig library (manifest `rigs:` key, spec §7.9).
+
+    Returns `{"version": int, "rigs": [...]}` or None. Same permissive posture
+    as every other side-file: missing / unreadable / malformed -> None, never
+    fatal — spec §7.9 is explicit that a rig library a Reader can't use MUST NOT
+    fail the pack.
+
+    Rig objects are kept **verbatim**. Only entries that could never be
+    addressed are dropped — a rig is reachable solely by `id` (from
+    `tones.base_rig` / `changes[].rig`), so a non-dict entry or one without a
+    usable string id is unreferenceable by construction. Everything else,
+    including unknown `role` / `engine` / `kind` values and `ext` namespaces,
+    passes through untouched, because this loader does not interpret rigs:
+    realization selection and the `intent.gm` fallback belong to whatever
+    voices the part.
+    """
+    try:
+        r_path = (source_dir / rel).resolve()
+        r_path.relative_to(source_dir.resolve())
+    except ValueError:
+        log.warning("sloppak: rigs path %r escapes source_dir — skipped", rel)
+        return None
+    except OSError as e:
+        log.warning("sloppak: rigs path resolution failed (%s) — skipped", e)
+        return None
+    if not r_path.exists():
+        return None
+    try:
+        raw = load_json(r_path)
+    except Exception as e:
+        log.warning("sloppak: failed to parse rigs %r: %s", rel, e)
+        return None
+    if not isinstance(raw, dict):
+        log.warning("sloppak: rigs %r ignored — expected dict, got %s",
+                    rel, type(raw).__name__)
+        return None
+    if not isinstance(raw.get("rigs"), list):
+        log.warning("sloppak: rigs %r ignored — 'rigs' must be a list", rel)
+        return None
+
+    clean_rigs: list[dict] = []
+    seen: set[str] = set()
+    for rig in raw["rigs"]:
+        if not isinstance(rig, dict):
+            continue
+        rid = rig.get("id")
+        if not isinstance(rid, str) or not rid.strip():
+            continue
+        # Normalize the library side of the lookup the same way the reference
+        # side is normalized in lib/tones.py — otherwise a pack with padded ids
+        # fails to resolve against a stripped `base_rig` / `rig`.
+        rid = rid.strip()
+        # A duplicate id makes `tones.base_rig` ambiguous, which would surface
+        # as the wrong sound rather than an error. First wins, loudly.
+        if rid in seen:
+            log.warning("sloppak: rigs %r has duplicate rig id %r — later one ignored",
+                        rel, rid)
+            continue
+        seen.add(rid)
+        clean_rigs.append({**rig, "id": rid})
+
+    # int only — a float version (incl. NaN/Inf, which json.loads accepts)
+    # would raise on int(); default rather than abort an optional side-file.
+    _ver = raw.get("version")
+    return {
+        "version": _ver if isinstance(_ver, int) and not isinstance(_ver, bool) else 1,
+        "rigs": clean_rigs,
+    }
+
+
+def _entry_tones(entry: dict) -> dict | None:
+    """A manifest entry's `tones` binding, or None when it doesn't carry one.
+
+    Spec §5.2: a manifest arrangement entry's `tones` overrides the arrangement
+    JSON's `tones` **wholesale** — no field-level merge. This normalizes the
+    "does it carry one" test for both the arrangement path and the drum path.
+
+    An empty dict reads as *absent*, not as "override to silence": it is what a
+    Writer emits by accident, `arrangement_from_wire` already normalizes the
+    in-JSON `{}` to None the same way, and treating it as an override would let
+    a stray empty object silently unbind a part's sound.
+    """
+    tones = entry.get("tones")
+    return tones if isinstance(tones, dict) and tones else None
+
+
+def _resolve_drum_parts(
+    source_dir: Path,
+    drum_tab_rel: object,
+    drum_tab_data: dict | None,
+    drum_pointer_entries: list[dict],
+    drum_tones: dict | None = None,
+) -> tuple[dict | None, list[dict] | None]:
+    """Resolve drum pointers into a primary-first list with unique ids.
+
+    Also binds each part's sound (feedpak 1.18.0). The precedence mirrors the
+    `drum_tab` alias rule this function already implements: a `type: drums`
+    entry's own `tones` wins for that part, and the song-level `drum_tones` is
+    the fallback for the **primary** part only. A Reader MUST NOT apply both to
+    the same part (spec §5.1/§5.2), which is why the primary picks one or the
+    other here rather than merging them.
+    """
+    if drum_tab_data is None and not drum_pointer_entries:
+        return drum_tab_data, None
+
+    primary_id = "drums"
+    primary_name = None
+    # The primary's own binding, lifted from its alias pointer entry when it has
+    # one. Stays None if no entry claims the primary — `drum_tones` fills in.
+    primary_tones = None
+    extra_parts: list[dict] = []
+    seen_rels: set[str] = set()
+    # Use the same canonical, traversal-safe identity as zip member lookup so
+    # equivalent spellings ("x.json", "./x.json", or backslashes) identify
+    # one file. Otherwise an alias pointer can reload and duplicate the primary.
+    primary_rel_key = (
+        _zip_member_key(drum_tab_rel.strip())
+        if isinstance(drum_tab_rel, str) and drum_tab_rel.strip() else None
+    )
+    for entry in drum_pointer_entries:
+        rel = str(entry.get("drum_tab") or "").strip()
+        rel_key = _zip_member_key(rel) if rel else None
+        rel_identity = rel_key or rel
+        if not rel or rel_identity in seen_rels:
+            continue
+        seen_rels.add(rel_identity)
+        entry_id = str(entry.get("id") or "").strip()
+        entry_name = str(entry.get("name") or "").strip()
+        if primary_rel_key is not None and rel_key == primary_rel_key:
+            if entry_id:
+                primary_id = entry_id
+            if entry_name:
+                primary_name = entry_name
+            # This entry IS the primary (an alias pointer at the same file), so
+            # its binding is the primary's — and it outranks `drum_tones`.
+            _alias_tones = _entry_tones(entry)
+            if _alias_tones is not None:
+                primary_tones = _alias_tones
+            continue
+        tab = _load_drum_tab_file(source_dir, rel, f"drum part {entry_id or rel}")
+        if tab is None:
+            continue
+        tab_name = tab.get("name")
+        extra_parts.append({
+            "id": entry_id,
+            "name": entry_name
+                or (tab_name if isinstance(tab_name, str) and tab_name else "Drums"),
+            "drum_tab": tab,
+            # Non-primary parts bind through their own entry only; `drum_tones`
+            # is explicitly the primary's fallback, never theirs.
+            "tones": _entry_tones(entry),
+        })
+
+    parts: list[dict] = []
+    used_ids: set[str] = set()
+    if drum_tab_data is not None:
+        if primary_name is None:
+            tab_name = drum_tab_data.get("name")
+            primary_name = tab_name if isinstance(tab_name, str) and tab_name else "Drums"
+        parts.append({
+            "id": primary_id,
+            "name": primary_name,
+            "drum_tab": drum_tab_data,
+            # Entry `tones` takes precedence; `drum_tones` is the fallback. One
+            # or the other, never both on the same part (spec §5.1).
+            "tones": primary_tones if primary_tones is not None else drum_tones,
+        })
+        used_ids.add(primary_id)
+
+    next_generated_id = 2
+    for part in extra_parts:
+        part_id = part["id"]
+        if not part_id or part_id in used_ids:
+            while f"drums-{next_generated_id}" in used_ids:
+                next_generated_id += 1
+            part_id = f"drums-{next_generated_id}"
+            next_generated_id += 1
+        part["id"] = part_id
+        used_ids.add(part_id)
+        parts.append(part)
+
+    if not parts:
+        return drum_tab_data, None
+    if drum_tab_data is None:
+        drum_tab_data = parts[0]["drum_tab"]
+    return drum_tab_data, parts
 
 
 def load_song(
@@ -740,6 +1010,7 @@ def load_song(
     notation_acc: dict[str, dict] = {}
     any_notation = False
     arrangement_ids_acc: list[str | None] = []  # parallel to song.arrangements
+    drum_pointer_entries: list[dict] = []  # feedpak 1.17.0 drum-part pointers
     for entry in manifest.get("arrangements", []) or []:
         if not isinstance(entry, dict):
             log.warning("sloppak: non-dict arrangement entry skipped (%r)", type(entry).__name__)
@@ -748,20 +1019,35 @@ def load_song(
         rel = rel_raw.strip() if isinstance(rel_raw, str) else ""
         notation_raw = entry.get("notation")
         has_notation_key = isinstance(notation_raw, str) and bool(notation_raw.strip())
-        if not rel and not has_notation_key:
+        _etype = str(entry.get("type") or "").strip().lower()
+        is_drums = _etype in ("drums", "drum")
+        # A drums-typed entry MUST NEVER become a fretted Arrangement (grading
+        # invariant, spec §5.2/§7.5): route on `type` FIRST, not on file
+        # absence — a malformed drums entry that also carries a note file/
+        # notation would otherwise fall through and grade as garbage.
+        if is_drums or (not rel and not has_notation_key):
+            # A DRUM-PART POINTER entry (feedpak 1.17.0 "drums as
+            # arrangements"): `type: drums` with a per-arrangement `drum_tab`
+            # file. Collect it for the drum-parts load after this loop.
+            if is_drums and isinstance(entry.get("drum_tab"), str):
+                drum_pointer_entries.append(entry)
+            elif is_drums:
+                # Drums-typed but no drum_tab pointer — drop it (any note
+                # file/notation it carries is ignored), never fret it.
+                log.warning(
+                    "sloppak: drums-typed arrangement entry %r has no drum_tab pointer — dropped",
+                    entry.get("id"),
+                )
+            elif isinstance(entry.get("drum_tab"), str):
+                log.warning(
+                    "sloppak: arrangement entry has drum_tab %r but type=%r — ignored",
+                    entry.get("drum_tab"), entry.get("type"),
+                )
             continue
         data = None
         if rel:
-            try:
-                arr_path = (source_dir / rel).resolve()
-                arr_path.relative_to(source_dir.resolve())
-            except ValueError:
-                log.warning("sloppak: arrangement path %r escapes source_dir — skipped", rel)
-                continue
-            except OSError as e:
-                log.warning("sloppak: arrangement path resolution failed (%s) — skipped", e)
-                continue
-            if not arr_path.exists():
+            arr_path = _resolve_pack_path(source_dir, rel, "arrangement")
+            if arr_path is None or not arr_path.exists():
                 continue
             try:
                 data = load_json(arr_path)
@@ -778,6 +1064,11 @@ def load_song(
         # the arrangement JSON (name, tuning, capo, centOffset).
         if entry.get("name"):
             arr.name = str(entry["name"])
+        # Editor-authored instrument type (feedpak-spec §5.2 / editor PR #335).
+        # Drives arrangement_string_count's bass fallback so a bass authored on
+        # an arrangement whose NAME doesn't say "bass" still reports 4 strings.
+        if entry.get("type"):
+            arr.type = str(entry["type"]).strip().lower()
         if "tuning" in entry:
             arr.tuning = list(entry["tuning"])
         if "capo" in entry:
@@ -786,6 +1077,14 @@ def load_song(
             # _finite_float keeps a malformed manifest NaN/Infinity from
             # poisoning the song_info JSON (same guard as the wire path).
             arr.cent_offset = _finite_float(entry["centOffset"])
+        # `tones` overrides WHOLESALE, unlike the field-level overrides above:
+        # the entry's object replaces the arrangement JSON's entirely, with no
+        # per-field merge (spec §5.2). A Writer SHOULD NOT emit both, but when
+        # one does, a half-merged sound — this pack's base with that pack's
+        # changes — would be worse than either source alone.
+        _entry_tone_block = _entry_tones(entry)
+        if _entry_tone_block is not None:
+            arr.tones = _entry_tone_block
 
         # Beats/sections can live on the arrangement itself in the wire format.
         # If the manifest-level arrangement JSON carries them, pull them onto
@@ -818,15 +1117,7 @@ def load_song(
         notation_rel = notation_rel.strip()
         if not notation_rel:
             continue
-        try:
-            nt_path = (source_dir / notation_rel).resolve()
-            nt_path.relative_to(source_dir.resolve())
-        except ValueError:
-            log.warning("sloppak: notation path %r escapes source_dir — skipped", notation_rel)
-            nt_path = None
-        except OSError as e:
-            log.warning("sloppak: notation path resolution failed (%s) — skipped", e)
-            nt_path = None
+        nt_path = _resolve_pack_path(source_dir, notation_rel, "notation")
         raw_nt = None
         if nt_path is not None and nt_path.exists():
             try:
@@ -854,32 +1145,20 @@ def load_song(
     drum_tab_data: dict | None = None
     drum_tab_rel = manifest.get("drum_tab")
     if isinstance(drum_tab_rel, str) and drum_tab_rel:
-        # Constrain to source_dir to prevent a crafted manifest from reading
-        # files outside the sloppak directory via path traversal (e.g. ../../etc).
-        # Wrap both resolve() calls in a broad handler: symlink loops and
-        # permission errors on .resolve() should disable drums, not abort load.
-        try:
-            dt_path = (source_dir / drum_tab_rel).resolve()
-            dt_path.relative_to(source_dir.resolve())
-        except ValueError:
-            log.warning("sloppak: drum_tab path %r escapes source_dir — skipped", drum_tab_rel)
-            dt_path = None
-        except OSError as e:
-            log.warning("sloppak: drum_tab path resolution failed (%s) — skipped", e)
-            dt_path = None
-        if dt_path is not None and dt_path.exists():
-            try:
-                raw = load_json(dt_path)
-            except Exception as e:
-                log.warning("sloppak: failed to parse drum_tab %r: %s", drum_tab_rel, e)
-                raw = None
-            if raw is not None:
-                ok, reason = drums_mod.validate_drum_tab(raw)
-                if ok:
-                    drum_tab_data = raw
-                else:
-                    log.warning("sloppak: drum_tab %r failed validation: %s",
-                                drum_tab_rel, reason)
+        drum_tab_data = _load_drum_tab_file(source_dir, drum_tab_rel, "drum_tab")
+
+    # Keep the dense compatibility logic independently testable and guarantee
+    # ids are unique before the highway exposes them as selectors.
+    # Top-level `drum_tones` (spec §5.1) binds the song-level drum part — the
+    # fallback for packs without `type: drums` arrangements. Same shape as an
+    # arrangement entry's `tones`; `_resolve_drum_parts` owns the precedence.
+    _raw_drum_tones = manifest.get("drum_tones")
+    drum_tones_data = _raw_drum_tones if isinstance(_raw_drum_tones, dict) and _raw_drum_tones else None
+
+    drum_tab_data, drum_parts = _resolve_drum_parts(
+        source_dir, drum_tab_rel, drum_tab_data, drum_pointer_entries,
+        drum_tones_data,
+    )
 
     # Drum-only sloppak: every GP track was percussion, so it ships a
     # drum_tab but no pitched arrangements. The highway WS rejects an empty
@@ -918,15 +1197,7 @@ def load_song(
     time_sigs_data: list | None = None
     song_timeline_rel = manifest.get("song_timeline")
     if isinstance(song_timeline_rel, str) and song_timeline_rel:
-        try:
-            st_path = (source_dir / song_timeline_rel).resolve()
-            st_path.relative_to(source_dir.resolve())
-        except ValueError:
-            log.warning("sloppak: song_timeline path %r escapes source_dir — skipped", song_timeline_rel)
-            st_path = None
-        except OSError as e:
-            log.warning("sloppak: song_timeline path resolution failed (%s) — skipped", e)
-            st_path = None
+        st_path = _resolve_pack_path(source_dir, song_timeline_rel, "song_timeline")
         if st_path is not None and st_path.exists():
             try:
                 raw = load_json(st_path)
@@ -1016,15 +1287,7 @@ def load_song(
     # downstream through the WS path.
     lyrics_rel = manifest.get("lyrics")
     if isinstance(lyrics_rel, str) and lyrics_rel:
-        try:
-            lyr_path = (source_dir / lyrics_rel).resolve()
-            lyr_path.relative_to(source_dir.resolve())
-        except ValueError:
-            log.warning("sloppak: lyrics path %r escapes source_dir — skipped", lyrics_rel)
-            lyr_path = None
-        except OSError as e:
-            log.warning("sloppak: lyrics path resolution failed (%s) — skipped", e)
-            lyr_path = None
+        lyr_path = _resolve_pack_path(source_dir, lyrics_rel, "lyrics")
         if lyr_path is not None and lyr_path.exists():
             try:
                 raw = load_json(lyr_path)
@@ -1100,12 +1363,19 @@ def load_song(
         sfile = str(s.get("file", ""))
         if not sid or not sfile:
             continue
-        default_val = s.get("default", True)
-        if isinstance(default_val, str):
-            default_on = default_val.lower() not in ("off", "false", "0", "no")
-        else:
-            default_on = bool(default_val)
-        stems.append({"id": sid, "file": sfile, "default": default_on})
+        entry = {
+            "id": sid,
+            "file": sfile,
+            "default": stem_default_on(s.get("default", True)),
+        }
+        # Optional presentational fields (feedpak 1.16.0, spec §5.3). Omitted —
+        # not None — when absent, so payload builders can pass entries through
+        # without every stem growing null keys.
+        for key in ("name", "description"):
+            val = s.get(key)
+            if isinstance(val, str) and val.strip():
+                entry[key] = val
+        stems.append(entry)
 
     # The complete mixdown is a stem (spec §5.3), but it is not a *layer*: lift
     # it out so that no consumer of `stems` — the mixer, the library's stem
@@ -1122,15 +1392,7 @@ def load_song(
     keys_data: dict | None = None
     keys_rel = manifest.get("keys")
     if isinstance(keys_rel, str) and keys_rel:
-        try:
-            k_path = (source_dir / keys_rel).resolve()
-            k_path.relative_to(source_dir.resolve())
-        except ValueError:
-            log.warning("sloppak: keys path %r escapes source_dir — skipped", keys_rel)
-            k_path = None
-        except OSError as e:
-            log.warning("sloppak: keys path resolution failed (%s) — skipped", e)
-            k_path = None
+        k_path = _resolve_pack_path(source_dir, keys_rel, "keys")
         if k_path is not None and k_path.exists():
             try:
                 raw = load_json(k_path)
@@ -1175,6 +1437,14 @@ def load_song(
                         "events": clean_events,
                     }
 
+    # Optional rigs.json — the pack's rig library (manifest `rigs:` key,
+    # spec §7.9). Loaded here so the highway WS can hand it to whatever voices
+    # the part; the bindings that reference it ride the arrangement's `tones`.
+    rigs_data: dict | None = None
+    rigs_rel = manifest.get("rigs")
+    if isinstance(rigs_rel, str) and rigs_rel:
+        rigs_data = _load_rigs_file(source_dir, rigs_rel)
+
     _fpv = manifest.get("feedpak_version")
     # The pack's full mix. Normally the RESERVED `full` stem partitioned out
     # above (spec §5.3) — no path work needed, it was validated with the other
@@ -1200,10 +1470,12 @@ def load_song(
         manifest=manifest,
         feedpak_version=_fpv if isinstance(_fpv, str) and _fpv else None,
         drum_tab=drum_tab_data,
+        drum_parts=drum_parts,
         song_timeline=song_timeline_data,
         tempos=tempos_data,
         time_signatures=time_sigs_data,
         keys=keys_data,
+        rigs=rigs_data,
         notation_by_id=notation_by_id_data,
         arrangement_ids=arrangement_ids_acc,
         full_mix=full_mix_data,
@@ -1225,6 +1497,27 @@ def _tuning_for_meta(arrangements_manifest: list[dict]) -> list[int]:
         if tun and isinstance(tun, list):
             return list(tun)
     return [0] * 6
+
+
+def _role_tuning_for_meta(arrangements_manifest: list[dict], role: str) -> list[int] | None:
+    """Per-ROLE companion to _tuning_for_meta: the tuning of the arrangement
+    playing `role` ("bass" / "rhythm"), or None when the pack has no such
+    arrangement with a tuning — the index then leaves that perspective's
+    columns empty and the library falls back to the song (guitar-first)
+    tuning, marking the row inferred.
+
+    Exact name first, then a looser containment pass so an alt/bonus chart
+    ("Bass 2", "Alt Rhythm") still beats pretending the part is in the lead
+    guitar's tuning."""
+    for match_exact in (True, False):
+        for entry in arrangements_manifest:
+            name = str(entry.get("name", "")).lower()
+            tun = entry.get("tuning")
+            if not (tun and isinstance(tun, list)):
+                continue
+            if name == role if match_exact else role in name:
+                return list(tun)
+    return None
 
 
 def extract_meta(path: Path) -> dict:
@@ -1249,6 +1542,10 @@ def extract_meta(path: Path) -> dict:
 
     has_lyrics = bool(manifest.get("lyrics"))
     tuning_offsets = _tuning_for_meta(arr_list)
+    # Per-role tunings alongside the song-level one, so the library can answer
+    # for whichever arrangement the player actually plays.
+    role_tunings = {f"{role}_tuning_offsets": _role_tuning_for_meta(arr_list, role)
+                    for role in ("bass", "rhythm")}
 
     stems_list = manifest.get("stems", []) or []
     valid_stems: list[dict] = []
@@ -1287,6 +1584,8 @@ def extract_meta(path: Path) -> dict:
         "disc": (lambda v: int(v) if str(v if v is not None else "").strip().isdigit() else None)(manifest.get("disc")),
         "duration": float(manifest.get("duration", 0) or 0),
         "tuning_offsets": tuning_offsets,  # caller maps to a name via tunings.tuning_name
+        # None = the pack has no arrangement in that role.
+        **role_tunings,
         "arrangements": arrangements,
         "has_lyrics": has_lyrics,
         "stem_count": stem_count,

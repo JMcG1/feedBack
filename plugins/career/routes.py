@@ -46,6 +46,8 @@ from pathlib import Path
 from fastapi import Body, HTTPException
 from fastapi.responses import FileResponse
 
+import sloppak
+from dlc_paths import _resolve_dlc_path
 from progression import instrument_for_arrangement
 
 PLUGIN_ID = "career"
@@ -53,6 +55,9 @@ VENUE_ID_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
 PACK_FILENAME_RE = re.compile(r"^[a-z0-9_-]{1,64}\.(mp4|webm|mp3|json)$")
 REQUIRED_LOOPS = ("bored", "neutral", "engaged", "ecstatic")
 DOWNLOAD_CHUNK = 1024 * 256
+# A setlist is a handful of songs; this endpoint unpacks zips, so cap the work an
+# arbitrary caller can ask for.
+MAX_GIG_SONGS = 32
 
 _lock = threading.Lock()
 _state = {
@@ -97,6 +102,13 @@ def _installed(venue_id):
 
 def _bundled(venue_id):
     return (_bundled_venue_dir(venue_id) / "manifest.json").is_file()
+
+
+def _pack_published(pack):
+    """A remote pack is downloadable only once a publish has stamped its real
+    size — the committed manifest carries a 0-byte placeholder (and an all-zero
+    sha) until then, so don't offer a download that can't succeed yet."""
+    return bool(pack and (pack.get("bytes") or 0) > 0)
 
 
 def _stars():
@@ -330,10 +342,11 @@ def _badge_requirement(gkey, instrument="guitar"):
 def _drill_by_node():
     doc = _load_json(_drill_file(), {})
     if not isinstance(doc, dict):
-        return None, {}
+        return None, {}, {}
     snapshot = doc.get("snapshot") if isinstance(doc.get("snapshot"), dict) else {}
     by_node = snapshot.get("byNode") if isinstance(snapshot.get("byNode"), dict) else {}
-    return doc.get("received_at"), by_node
+    gold = snapshot.get("goldImprov") if isinstance(snapshot.get("goldImprov"), dict) else {}
+    return doc.get("received_at"), by_node, gold
 
 
 def _merge_drill_nodes(old, new):
@@ -367,6 +380,16 @@ def _merge_drill_nodes(old, new):
     return out
 
 
+def _merge_gold(old, new):
+    """Gained-only merge of goldImprov artifacts: a minted style never
+    un-mints via a stale relay; the FIRST artifact per style is kept."""
+    out = dict(old)
+    for style_id, art in (new or {}).items():
+        if isinstance(art, dict) and style_id not in out:
+            out[style_id] = art
+    return out
+
+
 def _node_cleared(by_node, node_id):
     """A drill counts as cleared on real completion evidence: mastered, any
     depth rung flipped true, or a key cleared (a top-tier clean pass in one
@@ -388,7 +411,7 @@ def _passports_view():
     st = _career_state()
     all_gigs = st.get("gigs") if isinstance(st.get("gigs"), list) else []
     played, played_seconds = _played_by_instrument_genre()
-    received_at, by_node = _drill_by_node()
+    received_at, by_node, gold_improv = _drill_by_node()
     instruments = {}
     for inst in cfg.get("instruments") or []:
         committed_at = (st["instruments"].get(inst) or {}).get("committed_at")
@@ -414,7 +437,20 @@ def _passports_view():
                 # false badge denial — the doc's shown-not-judged rule.
                 badge = "shown_not_judged"
             elif qualifying >= req["songs"] and len(cleared) == len(required):
-                badge = "earned"
+                # Bronze is earned; GOLD upgrades it when a verified improv
+                # artifact exists for this genre's jam style. Virtuoso mints
+                # under raw STYLE_PALETTES ids ('punk', 'djent', 'disco', ...),
+                # which are mostly NOT family keys — so match in family space:
+                # the same keyword bucketing genres get ('punk' and 'punk
+                # rock' both bucket to 'rock'), with the exact key as a direct
+                # hit. Bronze remains a standalone win; gold never becomes an
+                # obligation.
+                fam = _genre_family(gkey)
+                gold = any(
+                    s == gkey or (fam is not None and _genre_family(s) == fam)
+                    for s in gold_improv
+                )
+                badge = "gold" if gold else "earned"
             else:
                 badge = "in_progress"
             # Practice invitation: the non-qualifying songs closest to the
@@ -493,27 +529,39 @@ def _current_venue():
     return best
 
 
-def _unplayed_genre_songs(gkey, exclude, limit):
-    """Library songs of a genre with no stats yet — a young passport's gig
-    still gets a full set (playing them is how stubs start).
-    ponytail: full stat-less scan + python-side genre match (a few ms at 7k
-    songs, single-user); push the match into SQL if propose ever feels slow."""
+def _fill_genre_songs(gkey, exclude, limit):
+    """Library songs of a genre to round out a gig — ANY song of the genre the
+    set hasn't already picked.
+
+    Was `_unplayed_genre_songs`, restricted to `filename NOT IN song_stats`.
+    That restriction created a hole: a song you'd played on a DIFFERENT
+    instrument's arrangement has a stats row, so it was excluded here — and it
+    lives in the played bucket for THAT instrument, not this passport's, so it
+    was excluded there too. It could never be gigged. A player with 137 metalcore
+    songs, all played on another instrument, got a 404 (reproduced). The player's
+    library is the pool; whether a song has stats on some other instrument has no
+    bearing on whether it can be in THIS gig.
+
+    Shuffled, so re-roll actually changes the set. The old version returned the
+    library's first N in table order every time, so re-roll was a no-op for any
+    set drawn from the filler (reproduced).
+
+    ponytail: full genre scan + python-side match + shuffle (a few ms at 7k
+    songs, single-user); push into SQL if propose ever feels slow.
+    """
     db = _state["meta_db"]
     if db is None:
         return []
     rows = db.conn.execute(
-        f"SELECT filename, title, artist, {_genre_expr(db)} AS g FROM songs "
-        "WHERE filename NOT IN (SELECT filename FROM song_stats)"
+        f"SELECT filename, title, artist, {_genre_expr(db)} AS g FROM songs"
     ).fetchall()
-    out = []
-    for filename, title, artist, genre in rows:
-        if _genre_key(genre) != gkey or filename in exclude:
-            continue
-        out.append({"filename": filename, "title": title or filename,
-                    "artist": artist or ""})
-        if len(out) >= limit:
-            break
-    return out
+    pool = [
+        {"filename": filename, "title": title or filename, "artist": artist or ""}
+        for filename, title, artist, genre in rows
+        if _genre_key(genre) == gkey and filename not in exclude
+    ]
+    random.shuffle(pool)   # re-roll must vary; free per call
+    return pool[:limit]
 
 
 def _validate_pack_dir(pack_dir: Path):
@@ -623,7 +671,7 @@ def setup(app, context):
                 "unlocked": stars_total >= v["star_threshold"],
                 "installed": _installed(v["id"]),
                 "bundled": _bundled(v["id"]),
-                "has_pack": _bundled(v["id"]) or bool(v.get("pack")),
+                "has_pack": _bundled(v["id"]) or _pack_published(v.get("pack")),
                 "download": dl,
             })
         return {
@@ -687,15 +735,84 @@ def setup(app, context):
         # drops junk entries, which must not become a size-guard bypass.
         if len(json.dumps(body["byNode"])) > DRILL_SNAPSHOT_MAX_BYTES:
             raise HTTPException(413, "Snapshot too large.")
+        gold_in = body.get("goldImprov", {})
+        if not isinstance(gold_in, dict):
+            # A relay bug must be LOUD, not a silent 200 that drops gold.
+            raise HTTPException(400, "goldImprov must be an object keyed by style id.")
+        # Keep only plausible artifacts: a dict that names its verifier —
+        # an empty {} must not mint an evidence-free gold.
+        gold_in = {k: v for k, v in gold_in.items()
+                   if isinstance(v, dict) and v.get("verifier")}
+        # Same pre-merge bound byNode gets: the gained-only merge dropping
+        # junk must not become a size-guard bypass (nor lock-held CPU burn).
+        if len(json.dumps(gold_in)) > DRILL_SNAPSHOT_MAX_BYTES:
+            raise HTTPException(413, "Snapshot too large.")
         with _lock:
-            _, existing = _drill_by_node()
+            _, existing, existing_gold = _drill_by_node()
             snapshot = {"mode": body.get("mode"), "xp": body.get("xp"),
-                        "byNode": _merge_drill_nodes(existing, body["byNode"])}
+                        "byNode": _merge_drill_nodes(existing, body["byNode"]),
+                        "goldImprov": _merge_gold(existing_gold, gold_in)}
             if len(json.dumps(snapshot)) > DRILL_SNAPSHOT_MAX_BYTES:
                 raise HTTPException(413, "Snapshot too large.")
             _save_json(_drill_file(), {"received_at": _now_iso(),
                                        "snapshot": snapshot})
         return {"ok": True}
+
+    @app.post(f"/api/plugins/{PLUGIN_ID}/gigs/prepare")
+    def prepare_gig(body: dict = Body(...)):
+        """Unpack every song of the set BEFORE the gig starts.
+
+        A feedpak is a zip: the first play of one pays for its extraction into
+        sloppak_cache. Inside a set that cost landed BETWEEN songs — the player
+        finished a number and then sat waiting for the next one to unpack, mid-
+        gig. A set is a known list up front, so extract it all while the player
+        is still looking at the poster.
+
+        Idempotent and cheap on a warm cache: resolve_source_dir() returns the
+        already-unpacked dir without rewriting it. Best-effort per song — one
+        bad feedpak must not block the set from starting (the play itself will
+        surface the error, exactly as it does outside a gig).
+        """
+        raw = (body or {}).get("songs")
+        # A str is iterable: without the list check, "abc" would prepare three
+        # one-character "songs". Cap the count too — this endpoint unpacks zips,
+        # so an oversized list is real work, and a setlist is a handful of songs.
+        if not isinstance(raw, list):
+            return {"ok": True, "prepared": 0, "failed": []}
+        files = [f for f in raw if isinstance(f, str) and f.strip()][:MAX_GIG_SONGS]
+        if not files:
+            return {"ok": True, "prepared": 0, "failed": []}
+
+        # .get, not []: a host that doesn't hand us the resolvers (or has no
+        # library configured) must degrade to "extract lazily, as before" — this
+        # is an optimisation, and it is never allowed to be the thing that stops
+        # a gig from starting.
+        get_dlc = context.get("get_dlc_dir")
+        get_cache = context.get("get_sloppak_cache_dir")
+        dlc_root = get_dlc() if callable(get_dlc) else None
+        cache_root = get_cache() if callable(get_cache) else None
+        if dlc_root is None or cache_root is None:
+            return {"ok": False, "prepared": 0, "failed": files, "error": "no library"}
+
+        root = Path(dlc_root)
+        prepared, failed = 0, []
+        for fn in files:
+            # CONTAINMENT FIRST. resolve_source_dir() does a bare
+            # `dlc_root / filename` with no guard, so a crafted `../..` would
+            # walk straight out of the library. Every other filename-bound
+            # handler validates through _resolve_dlc_path; so does this one.
+            safe = _resolve_dlc_path(root, fn)
+            if safe is None:
+                _state["log"].warning("career: gig pre-extract rejected unsafe path %r", fn)
+                failed.append(fn)
+                continue
+            try:
+                sloppak.resolve_source_dir(fn, root, Path(cache_root))
+                prepared += 1
+            except Exception as exc:   # noqa: BLE001 — one bad pak can't sink the set
+                _state["log"].warning("career: gig pre-extract failed for %s: %s", fn, exc)
+                failed.append(fn)
+        return {"ok": True, "prepared": prepared, "failed": failed}
 
     @app.post(f"/api/plugins/{PLUGIN_ID}/gigs/propose")
     def propose_gig(body: dict = Body(...)):
@@ -738,7 +855,7 @@ def setup(app, context):
             picks.append(s)
         if len(picks) < size:
             exclude = {s["filename"] for s in picks}
-            picks.extend(_unplayed_genre_songs(gkey, exclude, size - len(picks)))
+            picks.extend(_fill_genre_songs(gkey, exclude, size - len(picks)))
         if not picks:
             raise HTTPException(404, "No songs of this genre in the library.")
         venue = _current_venue()
@@ -824,7 +941,7 @@ def setup(app, context):
         if venue is None:
             raise HTTPException(404, "Unknown venue.")
         pack = venue.get("pack")
-        if not pack:
+        if not _pack_published(pack):
             raise HTTPException(404, "No pack published for this venue yet.")
         stars_total, _, _ = _stars()
         if stars_total < venue["star_threshold"]:

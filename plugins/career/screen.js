@@ -12,6 +12,10 @@
     'use strict';
 
     const API = '/api/plugins/career';
+    // Unpacking a setlist is real work (zips, possibly on a slow/network drive),
+    // so this is generous — but it is a CEILING, not a wait. Past it we start the
+    // gig and let the first play extract lazily, as it always did.
+    const PREPARE_TIMEOUT_MS = 60000;
     const VENUE_OVERRIDE_KEY = 'feedBack-career-venue';
     const NO_VENUE = '__none__';
     const PREV_VIZ_KEY = 'feedBack-career-prev-viz';
@@ -304,11 +308,15 @@
         } catch (_) { return {}; }
     }
 
-    function badgeId(inst, gkey) { return inst + '/' + gkey; }
+    // Bronze keeps the legacy un-suffixed id, so badges seen before the Gold
+    // tier existed stay seen; gold is a distinct moment with its own id.
+    function badgeId(inst, gkey, tier) { return inst + '/' + gkey + (tier === 'gold' ? '@gold' : ''); }
 
-    function markBadgeSeen(inst, gkey) {
+    function markBadgeSeen(inst, gkey, tier) {
         const seen = seenBadges();
-        seen[badgeId(inst, gkey)] = 1;
+        seen[badgeId(inst, gkey, tier)] = 1;
+        // A gold slam covers the bronze moment too — never queue both.
+        if (tier === 'gold') seen[badgeId(inst, gkey)] = 1;
         lsSet(PP_SEEN_KEY, JSON.stringify(seen));
     }
 
@@ -320,15 +328,19 @@
         const seen = seenBadges();
         for (const inst of Object.keys(view.instruments || {})) {
             for (const p of (view.instruments[inst].passports || [])) {
-                const id = badgeId(inst, p.genre_key);
-                if (p.badge !== 'earned' || seen[id] || _ppNotified[id]) continue;
+                if (p.badge !== 'earned' && p.badge !== 'gold') continue;
+                const gold = p.badge === 'gold';
+                const id = badgeId(inst, p.genre_key, p.badge);
+                if (seen[id] || _ppNotified[id]) continue;
                 _ppNotified[id] = true;
                 sfx('chime');
                 if (window.fbNotify && typeof window.fbNotify.show === 'function') {
                     window.fbNotify.show({
-                        big: true, icon: '🛂', accent: '#b45309',
-                        title: 'Badge earned!',
-                        message: `${p.genre} — Bronze, ready to stamp into your ${ppLabel(inst)} passport.`,
+                        big: true, icon: gold ? '🏅' : '🛂', accent: gold ? '#d9a253' : '#b45309',
+                        title: gold ? 'Gold — a verified improv!' : 'Badge earned!',
+                        message: gold
+                            ? `${p.genre} — your ${ppLabel(inst)} badge turns gold.`
+                            : `${p.genre} — Bronze, ready to stamp into your ${ppLabel(inst)} passport.`,
                     });
                 }
                 badgeCeremony(inst, p);
@@ -377,11 +389,11 @@
         el.innerHTML = `
             <canvas class="pp-confetti"></canvas>
             <div class="pp-ceremony-card">
-                <div class="pp-stamp pp-stamp-page pp-ceremony-stamp" style="--pp-rot:${ppJitter(p.genre_key, 7).toFixed(1)}deg">
+                <div class="pp-stamp pp-stamp-page pp-ceremony-stamp${p.badge === 'gold' ? ' pp-stamp-gold' : ''}" style="--pp-rot:${ppJitter(p.genre_key, 7).toFixed(1)}deg">
                     <span class="pp-stamp-genre">${esc(p.genre.toUpperCase())}</span>
-                    <span class="pp-stamp-tier">BRONZE</span>
+                    <span class="pp-stamp-tier">${p.badge === 'gold' ? 'GOLD' : 'BRONZE'}</span>
                 </div>
-                <div class="pp-ceremony-title">Badge earned</div>
+                <div class="pp-ceremony-title">${p.badge === 'gold' ? 'Gold — a verified improv' : 'Badge earned'}</div>
                 <div class="pp-ceremony-sub">${esc(p.genre)} — ${esc(ppLabel(inst))} passport</div>
             </div>`;
         let timer = 0;
@@ -445,7 +457,11 @@
             fetch(`${API}/drill-state`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ mode: snap.mode, xp: snap.xp, byNode: snap.byNode }),
+                body: JSON.stringify({
+                    mode: snap.mode, xp: snap.xp, byNode: snap.byNode,
+                    ...(snap.goldImprov && typeof snap.goldImprov === 'object' && !Array.isArray(snap.goldImprov)
+                        ? { goldImprov: snap.goldImprov } : {}),
+                }),
             }).then(() => refreshPassports()).catch(() => { /* next event retries */ });
         }, 1500);
     }
@@ -483,9 +499,9 @@
 
     function ppCoverHTML(inst, p) {
         const rot = ppJitter(inst + p.genre_key, 1.6).toFixed(2);
-        const earned = p.badge === 'earned';
+        const earned = p.badge === 'earned' || p.badge === 'gold';
         const stamp = earned
-            ? `<span class="pp-stamp pp-stamp-mini" style="--pp-rot:${ppJitter(p.genre_key, 8).toFixed(1)}deg">BRONZE</span>`
+            ? `<span class="pp-stamp pp-stamp-mini${p.badge === 'gold' ? ' pp-stamp-gold' : ''}" style="--pp-rot:${ppJitter(p.genre_key, 8).toFixed(1)}deg">${p.badge === 'gold' ? 'GOLD' : 'BRONZE'}</span>`
             : '';
         const stubs = p.qualifying_count === 1 ? '1 stub' : `${p.qualifying_count} stubs`;
         const hours = fmtHours(p.seconds_total);
@@ -599,7 +615,7 @@
         const data = (_pp.instruments || {})[inst] || { passports: [] };
         host.innerHTML = ((_pp.config || {}).instruments || []).map((i) => {
             const d = (_pp.instruments || {})[i] || {};
-            const earned = (d.passports || []).filter((p) => p.badge === 'earned').length;
+            const earned = (d.passports || []).filter((p) => p.badge === 'earned' || p.badge === 'gold').length;
             const committed = !!d.committed_at;
             return `<button class="pp-inst${i === inst ? ' active' : ''}${committed ? '' : ' uncommitted'}" data-pp-inst="${esc(i)}">
                 ${esc(ppLabel(i))}${earned ? ` <span class="pp-inst-badges">⚡${earned}</span>` : ''}${committed ? '' : ' <span class="pp-inst-plus">+</span>'}
@@ -641,13 +657,15 @@
         let badgeArea = '';
         if (p.badge === 'shown_not_judged') {
             badgeArea = `<div class="pp-snj">Shown, not judged — your ${esc(ppLabel(inst).toLowerCase())} repertoire speaks for itself.</div>`;
-        } else if (p.badge === 'earned') {
-            badgeArea = `<div class="pp-stamp pp-stamp-page${pendingSlam ? ' pp-stamp-hidden' : ' pp-tilt'}" style="--pp-rot:${ppJitter(p.genre_key, 7).toFixed(1)}deg">
+        } else if (p.badge === 'earned' || p.badge === 'gold') {
+            const gold = p.badge === 'gold';
+            badgeArea = `<div class="pp-stamp pp-stamp-page${pendingSlam ? ' pp-stamp-hidden' : ' pp-tilt'}${gold ? ' pp-stamp-gold' : ''}" style="--pp-rot:${ppJitter(p.genre_key, 7).toFixed(1)}deg">
                 <span class="pp-stamp-genre">${esc(p.genre.toUpperCase())}</span>
-                <span class="pp-stamp-tier">BRONZE</span>
+                <span class="pp-stamp-tier">${gold ? 'GOLD' : 'BRONZE'}</span>
             </div>
-            <div class="pp-gold-foil" aria-hidden="true">GOLD</div>
-            <div class="pp-gold-note">Gold rung coming — improvise it, verified.</div>
+            ${gold
+        ? '<div class="pp-gold-foil" aria-hidden="true">GOLD</div><div class="pp-gold-note">A verified improv — the comb heard it live.</div>'
+        : '<div class="pp-gold-note">Gold rung: improvise over this style in a Virtuoso jam — verified, not self-reported.</div>'}
             <div class="pp-card-actions">
                 <button class="career-btn career-btn-ghost" data-pp-card="save">Save card</button>
                 <button class="career-btn career-btn-ghost" data-pp-card="copy">Copy card</button>
@@ -724,7 +742,8 @@
         if (!p || !overlay) return;
         _ppBook = { inst, gkey };
         _ppReturnFocus = document.activeElement;
-        const pending = p.badge === 'earned' && !seenBadges()[badgeId(inst, gkey)];
+        const pending = (p.badge === 'earned' || p.badge === 'gold')
+            && !seenBadges()[badgeId(inst, gkey, p.badge)];
         overlay.innerHTML = ppBookHTML(inst, p, pending);
         overlay.classList.remove('hidden');
         const close = overlay.querySelector('.pp-book-close');
@@ -746,7 +765,7 @@
                 stamp.classList.add('pp-tilt'); // freshly slammed = trading card too
                 if (book) book.classList.add('pp-shake');
                 sfx('stamp');
-                markBadgeSeen(inst, gkey);
+                markBadgeSeen(inst, gkey, p.badge);
                 renderPassports(); // the shelf cover gains its mini-stamp
             }, 950);
         }
@@ -1108,10 +1127,52 @@
         sfx('page');
     }
 
-    function startGig() {
+    // Unpack the whole set before the first note.
+    //
+    // A feedpak is a zip, and the first play of one pays for its extraction. In
+    // a set that cost landed BETWEEN songs: the player finished a number and
+    // then sat there waiting for the next one to unpack, mid-gig. The setlist is
+    // known up front, so warm it all while the poster is still on screen.
+    //
+    // Best-effort by design: a library that won't pre-extract must not stop the
+    // gig from starting — the play itself surfaces the error the same way it
+    // does outside a gig. Slow is better than blocked.
+    async function prepareGigSongs(prop, btn) {
+        const label = btn && btn.textContent;
+        if (btn) { btn.disabled = true; btn.textContent = 'Preparing set…'; }
+        // A bare `await fetch(...)` only rejects on a network ERROR — a server
+        // that accepts the connection and then never answers hangs forever, and
+        // the gig would never start. That would make this optimisation the very
+        // thing it promises never to be: the reason you cannot play. Give up
+        // waiting and let the first play extract lazily, exactly as before.
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), PREPARE_TIMEOUT_MS);
+        try {
+            await fetch(`${API}/gigs/prepare`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ songs: prop.songs.map((s) => s.filename) }),
+                signal: ctrl.signal,
+            });
+        } catch (_) {
+            // abort, offline, non-2xx — all the same: start the gig anyway.
+        } finally {
+            clearTimeout(timer);
+            if (btn) { btn.disabled = false; if (label) btn.textContent = label; }
+        }
+    }
+
+    async function startGig(btn) {
         const prop = _ppGigProposal;
         const q = window.feedBack && window.feedBack.playQueue;
         if (!prop || !q || typeof q.start !== 'function' || typeof window.playSong !== 'function') return;
+
+        // Extract the setlist BEFORE the stage is borrowed and the queue starts,
+        // so a failure here leaves nothing half-applied to unwind.
+        await prepareGigSongs(prop, btn);
+        // The poster's Play could have been cancelled while we were unpacking.
+        if (_ppGigProposal !== prop) return;
+
         // The gig BORROWS the stage: stash whatever venue/viz the user had so
         // the set ending gives it back (unlike "Play here", which is an
         // explicit persistent choice on the venue card).
@@ -1131,7 +1192,21 @@
                 if (typeof window.setViz === 'function') window.setViz('venue');
             } catch (_) { /* viz optional — restore stays intact */ }
         }
+        // Push the gig's venue pack to the crowd layer NOW.
+        //
+        // crowd.setManifest(venue) is reached only through pushCrowdManifest,
+        // and pushCrowdManifest is called only from refresh() — the career
+        // tab's own reload. A gig navigates AWAY from the career tab to the
+        // player, so refresh() never runs during it, and setting the override
+        // above does nothing on its own. The result the testers saw: the venue
+        // visualization turns on (3D highway) but its crowd/stage pack never
+        // loads, so the song plays over the bare highway backdrop ("standard
+        // particles"), or over whatever venue a previous refresh() happened to
+        // leave applied. We just changed the override to this gig's venue, so
+        // re-push for it. _state is the career state the booking screen already
+        // fetched; guard for the rare null.
         _appliedManifestVenue = null;
+        if (_state) pushCrowdManifest(_state);
         _ppGigRun = {
             songs: prop.songs,
             venue_id: prop.venue_id,
@@ -1409,7 +1484,7 @@
         }
         const gigBtn = e.target.closest('[data-pp-gig]');
         if (gigBtn) { bookGig(gigBtn.dataset.ppGig); return; }
-        if (e.target.closest('[data-pp-gig-play]')) { startGig(); return; }
+        if (e.target.closest('[data-pp-gig-play]')) { startGig(e.target.closest('[data-pp-gig-play]')); return; }
         if (e.target.closest('[data-pp-gig-reroll]')) {
             if (_ppGigProposal) bookGig(_ppGigProposal.genre_key);
             return;
