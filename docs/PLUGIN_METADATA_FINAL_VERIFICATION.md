@@ -6,7 +6,7 @@ Verification record for the generic plugin metadata feature (`lib/plugin_metadat
 
 The PR changes nine files relative to `upstream/main`, confirmed via `git diff --stat upstream/main...HEAD`:
 
-```
+```text
 CHANGELOG.md
 docs/PLUGIN_METADATA_API.md
 docs/PLUGIN_METADATA_FINAL_VERIFICATION.md
@@ -26,7 +26,10 @@ Unrelated working-tree content — the pre-existing repo-wide CRLF/LF line-endin
 - Both surfaces return the same response shape and apply the same enrichment-gating rule.
 - The WebSocket handler may pass an already-loaded `base_metadata` (the sloppak manifest's `album`/`year`, already read for playback) so it can report current values without waiting for a library scan; the REST route has no loaded manifest and remains cache-only (`songs` table, populated at scan time).
 - `identifiers.*` (MusicBrainz recording/release/artist ID, ISRC) are populated only when the song's enrichment match state is `matched` or `manual` — a `review`/`failed`/`unscanned` row's candidate data is never surfaced as if confirmed.
-- The metadata delivery path makes no network request; every field comes from already-populated local SQLite tables or resolves to a safe default (`""`/`null`).
+- The metadata delivery path makes no network request; fields are resolved
+  from already-loaded sloppak manifest data where available, existing local
+  SQLite metadata and enrichment tables, or documented safe defaults
+  (`""`/`null`).
 
 ## Compatibility
 
@@ -39,34 +42,34 @@ Unrelated working-tree content — the pre-existing repo-wide CRLF/LF line-endin
 
 Commands run this session, from `core-development` on the current branch:
 
-```
+```console
 git diff --check upstream/main...HEAD
 ```
 → clean, no output.
 
-```
+```console
 git diff --stat upstream/main...HEAD
 ```
 → 9 files changed, 1179 insertions(+), 0 deletions(-) (matches the Scope section above).
 
-All three commands below were run this session on the contributor's own machine (Windows, Python 3.14.6, pytest 9.1.1, `rootdir: core-development`):
+All three pytest commands below were run this session on the contributor's own machine (Windows, Python 3.14.6, pytest 9.1.1, `rootdir: core-development`):
 
-```
+```console
 python -m pytest tests/test_plugin_metadata.py --collect-only -q
 ```
 → **23 items collected** in `test_plugin_metadata.py`: shape/version (2), playback metadata with no enrichment (1), year coercion (6 parametrized cases), album_artist always null (1), enrichment gating for `matched`/`manual`/`review`/`failed`/`unscanned` (5, including 3 parametrized), `base_metadata` resolution (7: per-field override of a populated cache, blank/zero values falling through to cache rather than clobbering it, partial `base_metadata` still pulling `genre` from cache, confirmed-enrichment unaffected by `base_metadata`, and unconfirmed-enrichment still hidden with `base_metadata`, 3 parametrized cases), and JSON round-trip (1).
 
-```
+```console
 python -m pytest tests/test_plugin_metadata.py tests/test_plugin_metadata_api.py -q
 ```
 → **31 passed**, 0 failed (23 + 8), 6.12s. 33 warnings, all pre-existing and unrelated to this feature (`StarletteDeprecationWarning` on `httpx`/`testclient`, and `on_event` lifespan deprecation warnings from `server.py`'s existing startup/shutdown handlers).
 
-```
+```console
 python -m pytest tests/test_highway_ws_authors.py tests/test_highway_ws_instrument_routing.py tests/test_highway_ws_notation.py tests/test_ws_highway_disconnect.py -q
 ```
 → **21 passed**, 0 failed (9 + 7 + 4 + 1), 3.37s — the existing highway WebSocket regression suite, unaffected by the new `song_info.metadata` key.
 
-```
+```console
 git diff --check upstream/main...HEAD
 ```
 → clean, no output.
