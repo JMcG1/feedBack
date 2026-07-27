@@ -171,15 +171,27 @@ window.feedBack.on('song:loaded', (e) => {
 });
 ```
 
-A plugin built against an older server (or one running against this
-server before this feature shipped) gets a `song_info` frame with no
-`metadata` key at all — but `static/highway.js` always assigns
-`metadata: msg.metadata ?? null` when building `currentSong`, so
-`song.metadata` is `null` in that case, not `undefined`.
-`song.metadata?.album` still evaluates safely to `undefined` rather
-than throwing (optional chaining short-circuits the same way on `null`
-as on `undefined`). No feature-detection dance is required for this
-specific kind of purely-additive change.
+An older server (or this server before this feature shipped) may omit
+the raw `metadata` field from the `song_info` message entirely — but
+`static/highway.js` always assigns `metadata: msg.metadata ?? null`
+when building `currentSong`, so `song.metadata` normalizes to `null`
+in that case, not `undefined`.
+
+- Field access can always use optional chaining, regardless of server
+  version: `song.metadata?.album` evaluates safely to `undefined` when
+  `song.metadata` is `null` (optional chaining short-circuits the same
+  way on `null` as on `undefined`).
+- A plugin that specifically needs to know whether metadata is
+  available at all — rather than just reading a field and tolerating
+  `undefined` — can check `song.metadata !== null`.
+- When `song.metadata` isn't `null`, it always has the full key shape
+  documented above (`version`, `album`, `album_artist`, `year`,
+  `genre`, `identifiers`, `enrichment`) — a plugin never needs to
+  check for the existence of an individual field once it has confirmed
+  the object itself isn't `null`.
+
+No feature-detection dance is required for this specific kind of
+purely-additive change.
 
 ## Choosing WebSocket vs. REST
 
